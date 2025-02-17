@@ -9,26 +9,108 @@ from django.http import JsonResponse
 from django.db.models import Q
 from django.views.decorators.csrf import csrf_exempt
 from django.core.paginator import Paginator
+from django.contrib.auth.decorators import *
+from django.shortcuts import get_object_or_404
+from decimal import Decimal
 
 def index(request):
+    top_products = Product.objects.filter(name="banner").annotate(likes_count=Count('likes__id')).order_by('-likes_count')[:5]
 
-    top_products = Product.objects.annotate(likes_count=Count('likes__id')).order_by('-likes_count')[:5]
-    
     flash_sales = FlashSale.objects.all()
 
     max_time = flash_sales.aggregate(max_end_time=Max('end_date'))['max_end_time'] if flash_sales else None
 
 
+    username = request.user.username 
+
     return render(request, 'pages/index.html', {
         'products': top_products,
         'flash_sales': flash_sales,
-        'max_time': max_time
+        'max_time': max_time,
+        'username': username,  
     })
 
 
 
+
+@login_required
+def wishlist(request):
+    liked_products = Product.objects.filter(likes=request.user).select_related("saler")
+    random_products = Product.objects.exclude(likes=request.user).exclude(name="banner").order_by('?')[:4]
+
+    # حساب old_price لكل منتج في liked_products
+    for product in liked_products:
+        product.old_price = Decimal(product.price) * Decimal(1.35)  # تحويل السعر إلى Decimal
+
+    # حساب old_price لكل منتج في random_products
+    for product in random_products:
+        product.old_price = Decimal(product.price) * Decimal(1.35)  # تحويل السعر إلى Decimal
+
+    # إضافة قائمة النجوم لكل منتج في random_products
+    for product in random_products:
+        product.star_list = range(int(round(product.rating)))  # تخصيص النجوم المملوءة
+
+    return render(request, 'pages/wishlist.html', {
+        'liked_products': liked_products,
+        'random_products': random_products
+    })
+@login_required
+def toggle_like(request, product_id):
+    product = get_object_or_404(Product, id=product_id)
+    
+    # إضافة أو إزالة اللايك
+    if request.user in product.likes.all():
+        product.likes.remove(request.user)  
+        liked = False
+    else:
+        product.likes.add(request.user)  
+        liked = True
+
+    # تحديث التقييمات
+    product.star_list = range(int(round(product.rating)))
+
+    # حفظ التغييرات في قاعدة البيانات (مهم)
+    product.save()
+
+    # إرجاع الاستجابة بالعدد الجديد للايكات
+    return JsonResponse({'liked': liked, 'likes_count': product.likes.count()})
+
 def about(request):
     return render(request, 'pages/about.html')
+
+
+
+
+
+def product(request, pk):
+    product = Product.objects.get(id=pk)
+    rating = getattr(product, 'rating', 0)
+    full_stars = int(rating)
+    empty_stars = 5 - full_stars  # عدد النجوم الفارغة
+
+    # المنتجات المشابهة
+    related_items = Product.objects.filter(category=product.category).exclude(id=pk)[:4]
+
+    # تجهيز بيانات النجوم للمنتجات المشابهة
+    for item in related_items:
+        item.star_list = range(int(item.rating))  # عدد النجوم الممتلئة
+        item.empty_stars = range(5 - int(item.rating))  # عدد النجوم الفارغة
+
+    return render(request, 'pages/onepro.html', {
+        'product': product,
+        'rating': rating,
+        'star_list': range(full_stars),
+        'empty_stars': range(empty_stars),
+        'related_items': related_items
+    })
+
+
+
+
+
+
+
+
 
 
 
@@ -44,15 +126,17 @@ def user_login(request):
             
             user = authenticate(username=username, password=password)
 
-            if user and isinstance(user, User):
+            if user:
                 login(request, user)
                 messages.success(request, "تم تسجيل الدخول بنجاح!")
                 return redirect('index')
             else:
                 messages.error(request, "اسم المستخدم أو كلمة المرور غير صحيحة.")
+        else:
+            messages.error(request, "الرجاء تعبئة جميع الحقول بشكل صحيح.")
     else:
         form = CustomLoginForm()
-    
+
     return render(request, 'pages/login.html', {'form': form})
 
 
@@ -68,17 +152,20 @@ def register(request):
             role = form.cleaned_data['role']
             phone_number = form.cleaned_data['phone_number']
 
+            # التحقق من وجود اسم المستخدم
             if User.objects.filter(username=username).exists():
                 messages.error(request, "اسم المستخدم هذا موجود بالفعل.")
                 return redirect('register')
 
+            # التحقق من وجود البريد الإلكتروني
             if User.objects.filter(email=email).exists():
                 messages.error(request, "البريد الإلكتروني هذا مسجل بالفعل.")
                 return redirect('register')
 
-            user = form.save(commit=False)  # نحفظ المستخدم بدون حفظ نهائي
+            # حفظ المستخدم وكلمة المرور
+            user = form.save(commit=False)
             user.set_password(form.cleaned_data['password1'])
-            user.save()  # نحفظ المستخدم عشان يتسجل في الداتابيز
+            user.save()  # حفظ المستخدم في الداتابيز
 
             # إنشاء الـ UserProfile وربطه بالمستخدم
             profile, created = UserProfile.objects.get_or_create(user=user)
@@ -86,14 +173,17 @@ def register(request):
             profile.phone_number = phone_number
             profile.save()
 
-            # تسجيل الدخول للمستخدم
+            # تسجيل الدخول للمستخدم بعد إنشاء الحساب
             login(request, user)
 
-            messages.success(request, "تم إنشاء الحساب بنجاح!")  
-            return redirect('index')  
+            # رسالة نجاح
+            messages.success(request, "تم إنشاء الحساب بنجاح! يمكنك الآن تسجيل الدخول.")
+            return redirect('index')  # إعادة التوجيه للصفحة الرئيسية بعد النجاح
 
         else:
-            print("Form Errors:", form.errors) 
+            # في حالة وجود أخطاء في النموذج
+            messages.error(request, "يرجى تصحيح الأخطاء المدخلة في النموذج.")
+            print("Form Errors:", form.errors)
 
     else:
         form = SignUpForm()
